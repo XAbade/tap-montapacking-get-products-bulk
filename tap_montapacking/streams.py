@@ -1,7 +1,8 @@
 """Stream type classes for tap-montapacking."""
 
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Union
 
+import backoff
 import requests
 from pendulum import parse
 from singer_sdk import typing as th  # JSON Schema typing helpers
@@ -15,7 +16,15 @@ from datetime import datetime, timedelta
 from backports.cached_property import cached_property
 import pytz
 from typing import TypeVar
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 _TToken = TypeVar("_TToken")
+
+# Maximum number of SKUs accepted by POST /products/bulk. Monta's docs say 1000,
+# but requests with more than 250 SKUs are rejected (reported to Monta).
+PRODUCTS_BULK_MAX_SKUS = 250
+# A failed bulk request is retried this many times before the sync fails
+PRODUCTS_BULK_MAX_RETRIES = 5
+PRODUCTS_BULK_RETRY_WAIT_SECONDS = 30
 
 # STREAMS TODO
 # PRODUCTS [x]
@@ -891,46 +900,109 @@ class ProductEventsStream(MontapackingStream):
 
         return {"last_eventId": next_page_token}
 
+    # SKUs waiting to be fetched by products_details, and the batches handed to it.
+    # The SKUs are kept here instead of in the child context so the SDK does not
+    # log the whole SKU list on every child sync.
+    _pending_skus: List[str] = []
+    sku_batches: Dict[int, List[str]] = {}
+
+    @property
+    def bulk_batch_size(self) -> int:
+        batch_size = int(self.config.get("products_bulk_batch_size") or PRODUCTS_BULK_MAX_SKUS)
+        return max(1, min(batch_size, PRODUCTS_BULK_MAX_SKUS))
+
     def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
-        """Return context for child streams."""
+        """Collect unique SKUs and return a child context once a batch is full."""
         product_sku = record.get("Sku")
         if not product_sku:
             return None
-        
-        encoded_product_sku = quote(product_sku, safe="")
 
-        if "%09" in encoded_product_sku.upper():
-            self.logger.warning(
-                "Skipping products_details for SKU containing encoded tab character. "
-                "EventId=%s Sku=%r EncodedSku=%s",
-                record.get("EventId"),
-                product_sku,
-                encoded_product_sku,
-            )
-            return None
-
-        # Only return context for unique Product SKUs to avoid duplicate child stream calls
+        # Only fetch unique Product SKUs to avoid duplicate product details
         if product_sku in self._unique_product_sku:
             return None
-        
+
         self._unique_product_sku.add(product_sku)
-        return {"product_sku": encoded_product_sku}
+        self._pending_skus.append(product_sku)
+
+        if len(self._pending_skus) >= self.bulk_batch_size:
+            return self._next_sku_batch()
+        return None
+
+    def _next_sku_batch(self) -> Optional[dict]:
+        if not self._pending_skus:
+            return None
+        batch_number = len(self.sku_batches) + 1
+        self.sku_batches[batch_number] = self._pending_skus
+        self._pending_skus = []
+        return {"sku_batch": batch_number, "sku_count": len(self.sku_batches[batch_number])}
+
+    def get_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
+        self._pending_skus = []
+        self.sku_batches = {}
+        yield from super().get_records(context)
+        # Fetch the remaining SKUs that did not fill a whole batch
+        self._sync_children(self._next_sku_batch())
 
     def _sync_children(self, child_context: dict) -> None:
         if child_context is not None:
             super()._sync_children(child_context)
+            # The batch has been fetched, free the SKU list
+            self.sku_batches[child_context["sku_batch"]] = []
 
 
 class ProductsDetailsStream(MontapackingStream):
-    """Define ProductsBySku as child stream of ProductEventsStream."""
+    """Fetch product details in bulk for the SKUs collected by ProductEventsStream."""
 
     name = "products_details"
-    path = "/product/{product_sku}/stock"
+    path = "/products/bulk"
+    rest_method = "POST"
     primary_keys = ["ProductId"]
     replication_key = None
-    records_jsonpath = "$"
+    records_jsonpath = "$[*]"
     paginate = False
     parent_stream_type = ProductEventsStream
+
+    def prepare_request_payload(
+        self, context: Optional[dict], next_page_token: Optional[Any]
+    ) -> Optional[list]:
+        parent = self._tap.streams[ProductEventsStream.name]
+        return parent.sku_batches[context["sku_batch"]]
+
+    def validate_response(self, response: requests.Response) -> None:
+        """Retry every failed bulk request; a missed batch would silently drop products."""
+        if response.status_code == 429:
+            # Sleeps until the rate limit window resets, then raises a retriable error
+            super().validate_response(response)
+
+        if response.status_code != 200:
+            raise RetriableAPIError(
+                f"Bulk request failed with status {response.status_code}: {response.text}",
+                response,
+            )
+        try:
+            products = response.json()
+        except RequestsJSONDecodeError:
+            raise RetriableAPIError(f"Bulk request returned invalid JSON: {response.text}", response)
+        if not isinstance(products, list):
+            raise RetriableAPIError(f"Bulk request did not return a product list: {response.text}", response)
+
+    def backoff_wait_generator(self) -> Generator[float, None, None]:
+        return backoff.constant(interval=PRODUCTS_BULK_RETRY_WAIT_SECONDS)
+
+    def backoff_max_tries(self) -> int:
+        # First attempt plus the retries
+        return PRODUCTS_BULK_MAX_RETRIES + 1
+
+    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
+        try:
+            yield from super().request_records(context)
+        except (RetriableAPIError, requests.exceptions.RequestException) as e:
+            # Fail the whole sync instead of moving on without this batch
+            raise FatalAPIError(
+                f"Bulk request for SKU batch {context['sku_batch']} "
+                f"({context['sku_count']} SKUs) failed after "
+                f"{PRODUCTS_BULK_MAX_RETRIES} retries: {e}"
+            ) from e
 
     schema = th.PropertiesList(
         th.Property("name", th.StringType),
