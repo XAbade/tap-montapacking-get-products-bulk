@@ -15,7 +15,12 @@ from datetime import datetime, timedelta
 from backports.cached_property import cached_property
 import pytz
 from typing import TypeVar
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 _TToken = TypeVar("_TToken")
+
+# Maximum number of SKUs accepted by POST /products/bulk. Monta's docs say 1000,
+# but requests with more than 250 SKUs are rejected (reported to Monta).
+PRODUCTS_BULK_MAX_SKUS = 250
 
 # STREAMS TODO
 # PRODUCTS [x]
@@ -891,12 +896,18 @@ class ProductEventsStream(MontapackingStream):
 
         return {"last_eventId": next_page_token}
 
+    # SKUs waiting to be fetched by products_details, and the batches handed to it.
+    # The SKUs are kept here instead of in the child context so the SDK does not
+    # log the whole SKU list on every child sync.
+    _pending_skus: List[str] = []
+    sku_batches: Dict[int, List[str]] = {}
+
     def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
-        """Return context for child streams."""
+        """Collect unique SKUs and return a child context once a batch is full."""
         product_sku = record.get("Sku")
         if not product_sku:
             return None
-        
+
         encoded_product_sku = quote(product_sku, safe="")
 
         if "%09" in encoded_product_sku.upper():
@@ -909,28 +920,68 @@ class ProductEventsStream(MontapackingStream):
             )
             return None
 
-        # Only return context for unique Product SKUs to avoid duplicate child stream calls
+        # Only fetch unique Product SKUs to avoid duplicate product details
         if product_sku in self._unique_product_sku:
             return None
-        
+
         self._unique_product_sku.add(product_sku)
-        return {"product_sku": encoded_product_sku}
+        # The bulk endpoint takes the SKUs in the JSON body, so they are sent unencoded
+        self._pending_skus.append(product_sku)
+
+        if len(self._pending_skus) >= PRODUCTS_BULK_MAX_SKUS:
+            return self._next_sku_batch()
+        return None
+
+    def _next_sku_batch(self) -> Optional[dict]:
+        if not self._pending_skus:
+            return None
+        batch_number = len(self.sku_batches) + 1
+        self.sku_batches[batch_number] = self._pending_skus
+        self._pending_skus = []
+        return {"sku_batch": batch_number, "sku_count": len(self.sku_batches[batch_number])}
+
+    def get_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
+        self._pending_skus = []
+        self.sku_batches = {}
+        yield from super().get_records(context)
+        # Fetch the remaining SKUs that did not fill a whole batch
+        self._sync_children(self._next_sku_batch())
 
     def _sync_children(self, child_context: dict) -> None:
         if child_context is not None:
             super()._sync_children(child_context)
+            # The batch has been fetched, free the SKU list
+            self.sku_batches[child_context["sku_batch"]] = []
 
 
 class ProductsDetailsStream(MontapackingStream):
-    """Define ProductsBySku as child stream of ProductEventsStream."""
+    """Fetch product details in bulk for the SKUs collected by ProductEventsStream."""
 
     name = "products_details"
-    path = "/product/{product_sku}/stock"
+    path = "/products/bulk"
+    rest_method = "POST"
     primary_keys = ["ProductId"]
     replication_key = None
-    records_jsonpath = "$"
+    records_jsonpath = "$[*]"
     paginate = False
     parent_stream_type = ProductEventsStream
+
+    def prepare_request_payload(
+        self, context: Optional[dict], next_page_token: Optional[Any]
+    ) -> Optional[list]:
+        parent = self._tap.streams[ProductEventsStream.name]
+        return parent.sku_batches[context["sku_batch"]]
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        try:
+            products = response.json()
+        except RequestsJSONDecodeError:
+            return
+        # A 404 is let through by validate_response and returns a message instead of a list
+        if not isinstance(products, list):
+            self.logger.warning("No products returned by bulk request: %s", response.text)
+            return
+        yield from extract_jsonpath(self.records_jsonpath, input=products)
 
     schema = th.PropertiesList(
         th.Property("name", th.StringType),
