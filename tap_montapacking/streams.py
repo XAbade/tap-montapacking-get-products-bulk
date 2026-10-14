@@ -1,8 +1,7 @@
 """Stream type classes for tap-montapacking."""
 
-from typing import Any, Dict, Generator, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
-import backoff
 import requests
 from pendulum import parse
 from singer_sdk import typing as th  # JSON Schema typing helpers
@@ -22,9 +21,6 @@ _TToken = TypeVar("_TToken")
 # Maximum number of SKUs accepted by POST /products/bulk. Monta's docs say 1000,
 # but requests with more than 250 SKUs are rejected (reported to Monta).
 PRODUCTS_BULK_MAX_SKUS = 250
-# A failed bulk request is retried this many times before the sync fails
-PRODUCTS_BULK_MAX_RETRIES = 5
-PRODUCTS_BULK_RETRY_WAIT_SECONDS = 30
 
 # STREAMS TODO
 # PRODUCTS [x]
@@ -976,41 +972,16 @@ class ProductsDetailsStream(MontapackingStream):
         parent = self._tap.streams[ProductEventsStream.name]
         return parent.sku_batches[context["sku_batch"]]
 
-    def validate_response(self, response: requests.Response) -> None:
-        """Retry every failed bulk request; a missed batch would silently drop products."""
-        if response.status_code == 429:
-            # Sleeps until the rate limit window resets, then raises a retriable error
-            super().validate_response(response)
-
-        if response.status_code != 200:
-            raise RetriableAPIError(
-                f"Bulk request failed with status {response.status_code}: {response.text}",
-                response,
-            )
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
         try:
             products = response.json()
         except RequestsJSONDecodeError:
-            raise RetriableAPIError(f"Bulk request returned invalid JSON: {response.text}", response)
+            return
+        # A 404 is let through by validate_response and returns a message instead of a list
         if not isinstance(products, list):
-            raise RetriableAPIError(f"Bulk request did not return a product list: {response.text}", response)
-
-    def backoff_wait_generator(self) -> Generator[float, None, None]:
-        return backoff.constant(interval=PRODUCTS_BULK_RETRY_WAIT_SECONDS)
-
-    def backoff_max_tries(self) -> int:
-        # First attempt plus the retries
-        return PRODUCTS_BULK_MAX_RETRIES + 1
-
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        try:
-            yield from super().request_records(context)
-        except (RetriableAPIError, requests.exceptions.RequestException) as e:
-            # Fail the whole sync instead of moving on without this batch
-            raise FatalAPIError(
-                f"Bulk request for SKU batch {context['sku_batch']} "
-                f"({context['sku_count']} SKUs) failed after "
-                f"{PRODUCTS_BULK_MAX_RETRIES} retries: {e}"
-            ) from e
+            self.logger.warning("No products returned by bulk request: %s", response.text)
+            return
+        yield from extract_jsonpath(self.records_jsonpath, input=products)
 
     schema = th.PropertiesList(
         th.Property("name", th.StringType),
