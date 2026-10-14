@@ -70,7 +70,6 @@ class TapMontapacking(Tap):
         th.Property("username", th.StringType, required=True, secret=True),
         th.Property("password", th.StringType, required=True, secret=True),
         th.Property("since_id", th.StringType, required=False, secret=True),
-        th.Property("products_bulk_batch_size", th.IntegerType, required=False),
     ).to_dict()
 
     def discover_streams(self) -> List[Stream]:

@@ -906,15 +906,19 @@ class ProductEventsStream(MontapackingStream):
     _pending_skus: List[str] = []
     sku_batches: Dict[int, List[str]] = {}
 
-    @property
-    def bulk_batch_size(self) -> int:
-        batch_size = int(self.config.get("products_bulk_batch_size") or PRODUCTS_BULK_MAX_SKUS)
-        return max(1, min(batch_size, PRODUCTS_BULK_MAX_SKUS))
-
     def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
         """Collect unique SKUs and return a child context once a batch is full."""
         product_sku = record.get("Sku")
         if not product_sku:
+            return None
+
+        if "\t" in product_sku:
+            self.logger.warning(
+                "Skipping products_details for SKU containing tab character. "
+                "EventId=%s Sku=%r",
+                record.get("EventId"),
+                product_sku,
+            )
             return None
 
         # Only fetch unique Product SKUs to avoid duplicate product details
@@ -924,7 +928,7 @@ class ProductEventsStream(MontapackingStream):
         self._unique_product_sku.add(product_sku)
         self._pending_skus.append(product_sku)
 
-        if len(self._pending_skus) >= self.bulk_batch_size:
+        if len(self._pending_skus) >= PRODUCTS_BULK_MAX_SKUS:
             return self._next_sku_batch()
         return None
 
