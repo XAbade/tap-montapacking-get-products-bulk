@@ -912,12 +912,15 @@ class ProductEventsStream(MontapackingStream):
         if not product_sku:
             return None
 
-        if "\t" in product_sku:
+        encoded_product_sku = quote(product_sku, safe="")
+
+        if "%09" in encoded_product_sku.upper():
             self.logger.warning(
-                "Skipping products_details for SKU containing tab character. "
-                "EventId=%s Sku=%r",
+                "Skipping products_details for SKU containing encoded tab character. "
+                "EventId=%s Sku=%r EncodedSku=%s",
                 record.get("EventId"),
                 product_sku,
+                encoded_product_sku,
             )
             return None
 
@@ -926,6 +929,7 @@ class ProductEventsStream(MontapackingStream):
             return None
 
         self._unique_product_sku.add(product_sku)
+        # The bulk endpoint takes the SKUs in the JSON body, so they are sent unencoded
         self._pending_skus.append(product_sku)
 
         if len(self._pending_skus) >= PRODUCTS_BULK_MAX_SKUS:
